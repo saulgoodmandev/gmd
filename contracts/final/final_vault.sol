@@ -11,11 +11,13 @@ import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
 interface GLPRouter{
   function unstakeAndRedeemGlp(address _tokenOut, uint256 _glpAmount, uint256 _minOut, address _receiver) external returns (uint256) ;
   function mintAndStakeGlp(address _token, uint256 _amount, uint256 _minUsdg, uint256 _minGlp) external  returns (uint256);
-  function claimFees() external;
-  function claimEsGmx() external;
-  function stakeEsGmx(uint256 _amount) external;
-}
 
+}
+interface rewardRouter { 
+    function claimFees() external;
+    function claimEsGmx() external;
+    function stakeEsGmx(uint256 _amount) external;
+}
 interface GDtoken is IERC20 {
     function mint(address recipient, uint256 _amount) external;
     function burn(address _from, uint256 _amount) external ;
@@ -52,10 +54,12 @@ contract vault is Ownable, ReentrancyGuard {
     //IERC20 public gdWETH;
     //IERC20 public gdWBTC;
     GLPRouter public _GLPRouter = GLPRouter(0xA906F338CB21815cBc4Bc87ace9e68c87eF8d8F1); 
+    rewardRouter public _RewardRouter = rewardRouter(0xA906F338CB21815cBc4Bc87ace9e68c87eF8d8F1);
     address poolGLP = 0x321F653eED006AD1C29D174e17d96351BDe22649;
-    GLPPriceFeed public priceFeed = GLPPriceFeed(0x06e31Ad70174D7dB1Eb06fCDa75Aa254E311BC3f);
+    GLPPriceFeed public priceFeed = GLPPriceFeed(0x846ecf0462981CC0f2674f14be6Da2056Fc16bDA);
 
     uint256 public compoundPercentage = 500;
+    uint256 public GLPbacking;
 
 
 
@@ -90,7 +94,7 @@ contract vault is Ownable, ReentrancyGuard {
             withdrawable: false,
             rewardStart: false,
             glpFees: 500, 
-            APR: 1500
+            APR: 1600
             
         }));
         poolInfo.push(PoolInfo({
@@ -104,7 +108,7 @@ contract vault is Ownable, ReentrancyGuard {
             withdrawable: false,
             rewardStart: false,
             glpFees: 250, 
-            APR: 700
+            APR: 1600
             
         }));
         
@@ -119,7 +123,7 @@ contract vault is Ownable, ReentrancyGuard {
             withdrawable: false,
             rewardStart: false,
             glpFees: 250, 
-            APR: 700
+            APR: 1600
             
         }));
 
@@ -149,20 +153,21 @@ contract vault is Ownable, ReentrancyGuard {
 
     function cycleRewardsETHandEsGMX() external onlyOwner {
 
-        _GLPRouter.claimEsGmx();
-        _GLPRouter.stakeEsGmx(EsGMX.balanceOf(address(this)));
+        _RewardRouter.claimEsGmx();
+        _RewardRouter.stakeEsGmx(EsGMX.balanceOf(address(this)));
         _cycleRewardsETH();
 
     }
 
     function cycleRewardsETH() external onlyOwner {
-            _cycleRewardsETH();
+        _cycleRewardsETH();
 
     }
 
     function _cycleRewardsETH() private {
         
-        _GLPRouter.claimFees();
+        updateGLPbackingNeeded();
+        _RewardRouter.claimFees();
         uint256 rewards = WETH.balanceOf(address(this));
         uint256 compoundAmount = rewards.mul(compoundPercentage).div(1000);
         swaptoGLP(compoundAmount, address(WETH));
@@ -175,6 +180,11 @@ contract vault is Ownable, ReentrancyGuard {
         compoundPercentage = _percent;
     }
 
+    function setGLPFees(uint256 _pid, uint256 _percent) external onlyOwner {
+        require(_percent < 1000, "not in range");
+        poolInfo[_pid].glpFees = _percent;
+    }
+
     // Unlocks the staked + gained USDC and burns xUSDC
     function updatePool(uint256 _pid) internal {
         uint256 timepass = block.timestamp.sub(poolInfo[_pid].lastUpdate);
@@ -183,6 +193,18 @@ contract vault is Ownable, ReentrancyGuard {
         poolInfo[_pid].totalStaked = poolInfo[_pid].totalStaked.add(reward);
         
     }
+
+    function updateOracle(GLPPriceFeed _newOracle) external onlyOwner {
+        priceFeed = _newOracle;
+    } 
+
+    function updateRouter(GLPRouter _newRouter) external onlyOwner {
+       _GLPRouter = _newRouter;
+    } 
+
+    function updateRewardRouter(rewardRouter _newRouter) external onlyOwner {
+       _RewardRouter = _newRouter;
+    } 
 
     function currentPoolTotal(uint256 _pid) public view returns (uint256) {
         uint reward =0;
@@ -203,7 +225,7 @@ contract vault is Ownable, ReentrancyGuard {
     }
 
     function setAPR(uint256 _pid, uint256 _apr) external onlyOwner {
-        require(_apr > 500 && _apr < 1600, " apr not in range");
+        require(_apr > 500 && _apr < 4000, " apr not in range");
         poolInfo[_pid].APR = _apr;
         if (poolInfo[_pid].rewardStart){
             updatePool(_pid);
@@ -211,17 +233,15 @@ contract vault is Ownable, ReentrancyGuard {
         updatePoolRate(_pid);
     }
 
-    function openVault(uint256 _pid) external onlyOwner {
+    function setOpenVault(uint256 _pid, bool open) external onlyOwner {
 
-        poolInfo[_pid].stakable = true;
-        poolInfo[_pid].withdrawable = false;
+        poolInfo[_pid].stakable = open;
         
     }
 
-    function openAllVault() external onlyOwner {
+    function setOpenAllVault(bool open) external onlyOwner {
         for (uint256 _pid = 0; _pid < poolInfo.length; ++ _pid){
-            poolInfo[_pid].stakable = true;
-            poolInfo[_pid].withdrawable = false; 
+            poolInfo[_pid].stakable = open;
         }
         
     }
@@ -242,17 +262,16 @@ contract vault is Ownable, ReentrancyGuard {
         
     }
 
-    function openWithdraw(uint256 _pid) external onlyOwner {
+    function openWithdraw(uint256 _pid, bool open) external onlyOwner {
 
-        poolInfo[_pid].stakable = false;
-        poolInfo[_pid].withdrawable = true;
+        poolInfo[_pid].withdrawable = open;
     }
 
-    function openAllWithdraw() external onlyOwner {
+    function openAllWithdraw(bool open) external onlyOwner {
 
         for (uint256 _pid = 0; _pid < poolInfo.length; ++ _pid){
-            poolInfo[_pid].stakable = false;
-            poolInfo[_pid].withdrawable = true;
+
+            poolInfo[_pid].withdrawable = open;
         }
     }
 
@@ -428,6 +447,7 @@ contract vault is Ownable, ReentrancyGuard {
         poolInfo[_pid].totalStaked = poolInfo[_pid].totalStaked.add(amountAfterFee);
 
         updatePoolRate(_pid);
+        updateGLPbackingNeeded();
         
         StakedToken.safeTransferFrom(msg.sender, address(this), _amountin);
         
@@ -480,7 +500,7 @@ contract vault is Ownable, ReentrancyGuard {
         swapGLPto(glpOut, address(StakedToken), amountSendOut);
         
         StakedToken.safeTransfer(msg.sender, amountSendOut);
-        
+        updateGLPbackingNeeded();
         return amountSendOut;
     }
 
@@ -513,7 +533,7 @@ contract vault is Ownable, ReentrancyGuard {
 
         //only allow to recover treasury tokens and not drain the vault
         require(((fsGLP.balanceOf(address(this)) - GLPamount) >= GLPbackingNeeded()), "below backing");
-   
+        treasuryMintedGLP = treasuryMintedGLP.sub(GLPamount);
         swapGLPto(GLPamount, _token, 0);
         IERC20(_token).safeTransfer(msg.sender,  IERC20(_token).balanceOf(address(this)));
         
@@ -553,6 +573,13 @@ contract vault is Ownable, ReentrancyGuard {
         uint256 glpPrice = priceFeed.getGLPprice();
 
         return totalUSDvaults().mul(10**12).div(glpPrice);
+    }
+
+    function updateGLPbackingNeeded() public returns(uint256) {
+
+        uint256 glpPrice = priceFeed.getGLPprice();
+        GLPbacking = totalUSDvaults().mul(10**12).div(glpPrice);
+        return GLPbacking;
     }
 
     function GLPinVault() public view returns(uint256) {
