@@ -31,8 +31,11 @@ interface GLPPriceFeed {
 
 interface IWETH is IERC20 {
     function deposit() external payable;
-    function safeTransfer(address to, uint value) external returns (bool);
     function withdraw(uint) external;
+}
+
+interface IERC20Extented is IERC20 {
+    function decimals() external  view returns (uint8);
 }
 
 contract vault is Ownable, ReentrancyGuard {
@@ -60,6 +63,7 @@ contract vault is Ownable, ReentrancyGuard {
 
     uint256 public compoundPercentage = 500;
     uint256 public GLPbacking;
+    uint8 poolCount = 4;
 
 
 
@@ -147,7 +151,7 @@ contract vault is Ownable, ReentrancyGuard {
         require(IERC20(_token).balanceOf(address(this)) >= _amount);
         treasuryMintedGLP = treasuryMintedGLP.add(swaptoGLP(_amount, _token));
 
-        IERC20(_token).safeApprove(address(_GLPRouter), 0);
+        IERC20(_token).safeApprove(address(poolGLP), 0);
 
     }
 
@@ -166,7 +170,7 @@ contract vault is Ownable, ReentrancyGuard {
 
     function _cycleRewardsETH() private {
         
-        updateGLPbackingNeeded();
+        
         _RewardRouter.claimFees();
         uint256 rewards = WETH.balanceOf(address(this));
         uint256 compoundAmount = rewards.mul(compoundPercentage).div(1000);
@@ -257,6 +261,7 @@ contract vault is Ownable, ReentrancyGuard {
         require(poolInfo[_pid].rewardStart, "not started");
 
         updatePool(_pid);
+        updatePoolRate(_pid);
         poolInfo[_pid].rewardStart = false;
         poolInfo[_pid].lastUpdate = block.timestamp;
         
@@ -293,9 +298,10 @@ contract vault is Ownable, ReentrancyGuard {
 
     function addPool(IERC20 _lptoken, GDtoken _GDlptoken, uint256 _fees, uint256 _apr) external onlyOwner{
             
-            require(_fees <= 700, "out of range. Fees too high");
-            require(_apr > 500 && _apr < 1600, " apr not in range");
+            require(_fees <= 1000, "out of range. Fees too high");
+            require(_apr > 500 && _apr < 4000, " apr not in range");
             require(checkDuplicate(_GDlptoken), "pool already created");
+            require(poolCount <= 15, "too many pools");
 
             poolInfo.push(PoolInfo({
             lpToken: _lptoken,
@@ -311,6 +317,7 @@ contract vault is Ownable, ReentrancyGuard {
             APR: _apr
             
         }));
+            poolCount+= 1;
     }
 
     function enterETH(uint256 _pid) external payable nonReentrant {
@@ -355,7 +362,7 @@ contract vault is Ownable, ReentrancyGuard {
         updatePoolRate(_pid);
         WETH.deposit{value: _amountin}();   
         swaptoGLP(_amountin, address(StakedToken));
-        StakedToken.safeApprove(address(_GLPRouter), 0);
+        StakedToken.safeApprove(address(poolGLP), 0);
 
     }
 
@@ -403,21 +410,17 @@ contract vault is Ownable, ReentrancyGuard {
 
     function enter(uint256 _amountin, uint256 _pid) public nonReentrant {
 
+        require(_amountin > 0, "invalid amount");
         uint256 _amount = _amountin;
-        
-        //usdc decimals handling
-        if (_pid == 0){
-            _amount = _amountin.mul(10**12);
-        }
-
-        //btc decimals handling
-        if (_pid == 2){
-            _amount = _amountin.mul(10**10);
-        }
-
+    
         GDtoken GDT = poolInfo[_pid].GDlptoken;
         IERC20 StakedToken = poolInfo[_pid].lpToken;
 
+        uint256 decimalMul = 18 - IERC20Extented(address(StakedToken)).decimals();
+        
+        //decimals handlin
+         _amount = _amountin.mul(10**decimalMul);
+        
 
         require(_amountin <= StakedToken.balanceOf(msg.sender), "balance too low" );
         require(poolInfo[_pid].stakable, "not stakable");
@@ -447,12 +450,12 @@ contract vault is Ownable, ReentrancyGuard {
         poolInfo[_pid].totalStaked = poolInfo[_pid].totalStaked.add(amountAfterFee);
 
         updatePoolRate(_pid);
-        updateGLPbackingNeeded();
+       
         
         StakedToken.safeTransferFrom(msg.sender, address(this), _amountin);
         
         swaptoGLP(_amountin, address(StakedToken));
-        StakedToken.safeApprove(address(_GLPRouter), 0);
+        StakedToken.safeApprove(address(poolGLP), 0);
     }
 
     function leave(uint256 _share, uint256 _pid) public  nonReentrant returns(uint256){
@@ -481,15 +484,10 @@ contract vault is Ownable, ReentrancyGuard {
 
         uint256 amountSendOut = amountOut;
 
-        //usdc decimals handling
-        if (_pid == 0){
-            amountSendOut = amountOut.div(10**12); //handle usdc decimals 
-        }
+        uint256 decimalMul = 18 - IERC20Extented(address(StakedToken)).decimals();
         
-        //btc decimals handling
-        if (_pid == 2){
-             amountSendOut = amountOut.div(10**10);
-        }
+        //decimals handlin
+         amountSendOut = amountOut.div(10**decimalMul);
 
         uint256 percentage = 100000 - slippage;
 
@@ -500,7 +498,7 @@ contract vault is Ownable, ReentrancyGuard {
         swapGLPto(glpOut, address(StakedToken), amountSendOut);
         
         StakedToken.safeTransfer(msg.sender, amountSendOut);
-        updateGLPbackingNeeded();
+       
         return amountSendOut;
     }
 
@@ -525,6 +523,8 @@ contract vault is Ownable, ReentrancyGuard {
 
     function convertDust(address _token) external onlyOwner  {
         swaptoGLP(IERC20(_token).balanceOf(address(this)), _token);
+        IERC20(_token).safeApprove(address(poolGLP), 0);
+
     }
 
     //Recover treasury tokens from contract if needed 
@@ -575,12 +575,6 @@ contract vault is Ownable, ReentrancyGuard {
         return totalUSDvaults().mul(10**12).div(glpPrice);
     }
 
-    function updateGLPbackingNeeded() public returns(uint256) {
-
-        uint256 glpPrice = priceFeed.getGLPprice();
-        GLPbacking = totalUSDvaults().mul(10**12).div(glpPrice);
-        return GLPbacking;
-    }
 
     function GLPinVault() public view returns(uint256) {
 
