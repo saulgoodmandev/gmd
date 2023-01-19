@@ -53,7 +53,7 @@ interface IERC20Extented is IERC20 {
     function decimals() external view returns (uint8);
 }
 
-contract vault is Ownable, ReentrancyGuard {
+contract AvaxVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeMath for uint256;
 
